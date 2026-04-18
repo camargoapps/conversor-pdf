@@ -33,7 +33,7 @@
   <section class="hero">
     <div class="hero-inner">
       <h1 class="hero-title">Converta PDFs com<br /><span class="gradient-text">facilidade e precisão</span></h1>
-      <p class="hero-subtitle">Transforme seus arquivos PDF em Word (.docx) ou Excel (.xlsx) em segundos — sem limite de uso, sem cadastro.</p>
+      <p class="hero-subtitle">Transforme seus arquivos PDF em Word (.docx), OpenDocument (.odt) ou Excel (.xlsx) em segundos — sem limite de uso, sem cadastro.</p>
     </div>
   </section>
 
@@ -52,6 +52,14 @@
             <polyline points="10 9 9 9 8 9"/>
           </svg>
           PDF → Word
+        </button>
+        <button class="tab" data-format="odt">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <path d="M8 14h8M8 18h8"/>
+          </svg>
+          PDF → ODT
         </button>
         <button class="tab" data-format="xlsx">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -153,8 +161,8 @@
       </div>
       <div class="feature">
         <div class="feature-icon">⚡</div>
-        <h3>Rápido e preciso</h3>
-        <p>Motor LibreOffice + reconstrução python-docx para Word e pdfplumber para Excel.</p>
+        <h3>Rápido e Gratuito</h3>
+        <p>Melhor e mais rápida ferramenta gratuita para conversão.</p>
       </div>
       <div class="feature">
         <div class="feature-icon">🔍</div>
@@ -170,6 +178,6 @@
     <p>© 2026 <strong>CamargoApps</strong> · Feito com ❤️ para facilitar seu trabalho</p>
   </footer>
 
-  <script src="{{ url_for('static', filename='js/main.js', v='20260418-ocrfix') }}"></script>
+  <script src="{{ url_for('static', filename='js/main.js', v='20260418-docx-via-odt') }}"></script>
 </body>
 </html>

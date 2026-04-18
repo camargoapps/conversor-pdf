@@ -102,7 +102,11 @@
     startFakeProgress();
 
     try {
-      const res = await fetch('/convert', { method: 'POST', body: formData });
+      const successText = alertSuccess.querySelector('span');
+      if (successText) {
+        successText.textContent = 'Arquivo convertido com sucesso! O download iniciará automaticamente.';
+      }
+      let res = await fetch('/convert', { method: 'POST', body: formData });
 
       if (!res.ok) {
         const contentType = (res.headers.get('Content-Type') || '').toLowerCase();

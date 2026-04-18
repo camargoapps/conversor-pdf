@@ -49,33 +49,414 @@ def _pick_runtime_tmpdir() -> str:
 def _libreoffice_bin() -> str:
     """Localiza o executável do LibreOffice (Windows ou Linux)."""
     import shutil
-    for cmd in ("libreoffice", "soffice"):
-        if shutil.which(cmd):
-            return cmd
+    # No Windows, prioriza caminho absoluto conhecido para evitar binários quebrados no PATH.
     for p in (
         r"C:\Program Files\LibreOffice\program\soffice.exe",
         r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        r"C:\Program Files\LibreOffice\program\soffice.com",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.com",
     ):
         if os.path.isfile(p):
             return p
+    # Fallback por PATH.
+    for cmd in ("soffice.com", "libreoffice", "soffice"):
+        found = shutil.which(cmd)
+        if found:
+            return found
     raise FileNotFoundError("LibreOffice não encontrado.")
+
+
+def _prepare_lo_env(lo_bin: str) -> dict:
+    """
+    Prepara ambiente isolado para subprocesso do LibreOffice.
+    Evita erro 'Could not find platform independent libraries' em alguns ambientes.
+    """
+    env = os.environ.copy()
+    # Remove variáveis de Python que podem interferir no runtime interno do LibreOffice.
+    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "VIRTUAL_ENV", "CONDA_PREFIX"):
+        env.pop(key, None)
+
+    lo_dir = os.path.dirname(os.path.abspath(lo_bin))
+    if lo_dir:
+        env["PATH"] = lo_dir + os.pathsep + env.get("PATH", "")
+        env["URE_BOOTSTRAP"] = f"vnd.sun.star.pathname:{os.path.join(lo_dir, 'fundamental.ini')}"
+
+        # Alguns ambientes Windows precisam de PYTHONHOME explícito do runtime embutido do LO.
+        try:
+            pycore = next(
+                (
+                    os.path.join(lo_dir, d)
+                    for d in os.listdir(lo_dir)
+                    if d.lower().startswith("python-core-") and os.path.isdir(os.path.join(lo_dir, d))
+                ),
+                None,
+            )
+            if pycore:
+                env["PYTHONHOME"] = pycore
+        except Exception:
+            pass
+    env["PYTHONNOUSERSITE"] = "1"
+
+    env["SAL_DISABLE_SYNCHRONOUS_PRINTER_DETECTION"] = "1"
+    env["SAL_DISABLE_PRINTERLIST"] = "1"
+    env["SAL_USE_VCLPLUGIN"] = "svp"
+    return env
 
 
 def _docx_via_libreoffice(pdf_path: str, output_path: str) -> None:
     """Converte via LibreOffice headless — MPL-2.0, uso comercial livre."""
-    import subprocess, shutil
+    import subprocess, shutil, tempfile
     lo = _libreoffice_bin()
     out_dir = os.path.dirname(output_path)
+    stem = Path(pdf_path).stem
+    lo_out = os.path.join(out_dir, f"{stem}.docx")
+
+    def _run_convert(input_path: str, convert_to: str, outdir: str, timeout_s: int,
+                     infilter: str | None = None, profile_uri: str | None = None) -> tuple[bool, str]:
+        cmd = [
+            lo,
+            "--headless",
+            "--invisible",
+            "--norestore",
+            "--nodefault",
+            "--nolockcheck",
+            "--nofirststartwizard",
+            "--nologo",
+        ]
+        if profile_uri:
+            cmd.append(f"-env:UserInstallation={profile_uri}")
+        if infilter:
+            cmd.append(f"--infilter={infilter}")
+        cmd.extend(["--convert-to", convert_to, "--outdir", outdir, input_path])
+        try:
+            run_env = _prepare_lo_env(lo)
+            lo_cwd = os.path.dirname(os.path.abspath(lo))
+            startupinfo = None
+            creationflags = 0
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                env=run_env,
+                cwd=lo_cwd,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+            if r.returncode == 0:
+                return True, ""
+            msg = (r.stderr or "").strip() or (r.stdout or "").strip() or "erro sem detalhes"
+            return False, msg
+        except subprocess.TimeoutExpired as te:
+            return False, f"timeout ({timeout_s}s)"
+        except Exception as ex:
+            return False, str(ex)
+
+    def _ensure_docx(at_path: str) -> bool:
+        return os.path.isfile(at_path) and os.path.getsize(at_path) > 0
+
+    # Sempre usa perfil isolado: evita anexar a sessão aberta do LibreOffice (popup de impressora).
+    lo_profile = tempfile.mkdtemp(prefix="lo-profile-", dir=_pick_runtime_tmpdir())
+    profile_uri = Path(lo_profile).as_uri()
+    errors: list[str] = []
+    try:
+        # 1) Pipeline mais fiel: PDF -> ODT -> DOCX.
+        tdir = tempfile.mkdtemp(prefix="lo-odt-", dir=_pick_runtime_tmpdir())
+        try:
+            odt_path = os.path.join(tdir, f"{stem}.odt")
+            ok, err = _run_convert(
+                input_path=pdf_path,
+                convert_to="odt:writer8",
+                outdir=tdir,
+                timeout_s=90,
+                infilter="draw_pdf_import",
+                profile_uri=profile_uri,
+            )
+            if ok and os.path.isfile(odt_path):
+                ok2, err2 = _run_convert(
+                    input_path=odt_path,
+                    convert_to="docx:MS Word 2007 XML",
+                    outdir=out_dir,
+                    timeout_s=90,
+                    profile_uri=profile_uri,
+                )
+                if ok2 and _ensure_docx(lo_out):
+                    if os.path.abspath(lo_out) != os.path.abspath(output_path):
+                        shutil.move(lo_out, output_path)
+                    return
+                errors.append(f"ODT->DOCX: {err2}")
+            else:
+                errors.append(f"PDF->ODT: {err}")
+        finally:
+            shutil.rmtree(tdir, ignore_errors=True)
+
+        # 2) Draw direto -> DOCX (fallback).
+        ok, err = _run_convert(
+            input_path=pdf_path,
+            convert_to="docx:MS Word 2007 XML",
+            outdir=out_dir,
+            timeout_s=90,
+            infilter="draw_pdf_import",
+            profile_uri=profile_uri,
+        )
+        if ok and _ensure_docx(lo_out):
+            if os.path.abspath(lo_out) != os.path.abspath(output_path):
+                shutil.move(lo_out, output_path)
+            return
+        errors.append(f"PDF->DOCX (Draw): {err}")
+
+        # 3) Fallback: Writer import padrão -> DOCX.
+        ok, err = _run_convert(
+            input_path=pdf_path,
+            convert_to="docx:MS Word 2007 XML",
+            outdir=out_dir,
+            timeout_s=60,
+            profile_uri=profile_uri,
+        )
+        if ok and _ensure_docx(lo_out):
+            if os.path.abspath(lo_out) != os.path.abspath(output_path):
+                shutil.move(lo_out, output_path)
+            return
+        errors.append(f"PDF->DOCX (padrão): {err}")
+
+        # 4) Tentativa em 2 etapas (Draw): PDF -> ODG -> DOCX.
+        tdir = tempfile.mkdtemp(prefix="lo-draw-", dir=_pick_runtime_tmpdir())
+        try:
+            odg_path = os.path.join(tdir, f"{stem}.odg")
+            ok, err = _run_convert(
+                input_path=pdf_path,
+                convert_to="odg",
+                outdir=tdir,
+                timeout_s=60,
+                infilter="draw_pdf_import",
+                profile_uri=profile_uri,
+            )
+            if ok and os.path.isfile(odg_path):
+                ok2, err2 = _run_convert(
+                    input_path=odg_path,
+                    convert_to="docx:MS Word 2007 XML",
+                    outdir=out_dir,
+                    timeout_s=60,
+                    profile_uri=profile_uri,
+                )
+                if ok2 and _ensure_docx(lo_out):
+                    if os.path.abspath(lo_out) != os.path.abspath(output_path):
+                        shutil.move(lo_out, output_path)
+                    return
+                errors.append(f"ODG->DOCX: {err2}")
+            else:
+                errors.append(f"PDF->ODG: {err}")
+        finally:
+            shutil.rmtree(tdir, ignore_errors=True)
+    finally:
+        shutil.rmtree(lo_profile, ignore_errors=True)
+
+    raise RuntimeError(" | ".join(e for e in errors if e) or "Erro no LibreOffice")
+
+
+def _odt_via_libreoffice(pdf_path: str, output_path: str) -> None:
+    """Converte PDF para ODT via LibreOffice (modo Draw, perfil isolado)."""
+    import subprocess, shutil, tempfile
+    lo = _libreoffice_bin()
+    out_dir = os.path.dirname(output_path)
+    stem = Path(pdf_path).stem
+    lo_out = os.path.join(out_dir, f"{stem}.odt")
+
+    def _run_convert(input_path: str, convert_to: str, timeout_s: int,
+                     infilter: str | None = None, profile_uri: str | None = None) -> tuple[bool, str]:
+        cmd = [
+            lo,
+            "--headless",
+            "--invisible",
+            "--norestore",
+            "--nodefault",
+            "--nolockcheck",
+            "--nofirststartwizard",
+            "--nologo",
+        ]
+        if profile_uri:
+            cmd.append(f"-env:UserInstallation={profile_uri}")
+        if infilter:
+            cmd.append(f"--infilter={infilter}")
+        cmd.extend(["--convert-to", convert_to, "--outdir", out_dir, input_path])
+        try:
+            run_env = _prepare_lo_env(lo)
+            lo_cwd = os.path.dirname(os.path.abspath(lo))
+            startupinfo = None
+            creationflags = 0
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                env=run_env,
+                cwd=lo_cwd,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+            if r.returncode == 0:
+                return True, ""
+            msg = (r.stderr or "").strip() or (r.stdout or "").strip() or "erro sem detalhes"
+            return False, msg
+        except subprocess.TimeoutExpired:
+            return False, f"timeout ({timeout_s}s)"
+        except Exception as ex:
+            return False, str(ex)
+
+    lo_profile = tempfile.mkdtemp(prefix="lo-profile-", dir=_pick_runtime_tmpdir())
+    profile_uri = Path(lo_profile).as_uri()
+    errors: list[str] = []
+    try:
+        ok, err = _run_convert(
+            input_path=pdf_path,
+            convert_to="odt:writer8",
+            timeout_s=180,
+            profile_uri=profile_uri,
+        )
+        if ok and os.path.isfile(lo_out) and os.path.getsize(lo_out) > 0:
+            if os.path.abspath(lo_out) != os.path.abspath(output_path):
+                shutil.move(lo_out, output_path)
+            return
+        errors.append(f"PDF->ODT: {err}")
+
+        # Fallback com importador Draw explícito.
+        ok, err = _run_convert(
+            input_path=pdf_path,
+            convert_to="odt:writer8",
+            timeout_s=180,
+            infilter="draw_pdf_import",
+            profile_uri=profile_uri,
+        )
+        if ok and os.path.isfile(lo_out) and os.path.getsize(lo_out) > 0:
+            if os.path.abspath(lo_out) != os.path.abspath(output_path):
+                shutil.move(lo_out, output_path)
+            return
+        errors.append(f"PDF->ODT (Draw): {err}")
+
+    finally:
+        shutil.rmtree(lo_profile, ignore_errors=True)
+
+    raise RuntimeError(" | ".join(e for e in errors if e) or "Erro no LibreOffice")
+
+
+def _odt_to_docx_via_libreoffice(odt_path: str, output_path: str) -> None:
+    """Converte ODT -> DOCX via LibreOffice com perfil isolado."""
+    import subprocess, shutil, tempfile
+    lo = _libreoffice_bin()
+    out_dir = os.path.dirname(output_path)
+    stem = Path(odt_path).stem
+    lo_out = os.path.join(out_dir, f"{stem}.docx")
+
+    lo_profile = tempfile.mkdtemp(prefix="lo-profile-", dir=_pick_runtime_tmpdir())
+    try:
+        profile_uri = Path(lo_profile).as_uri()
+        run_env = _prepare_lo_env(lo)
+        lo_cwd = os.path.dirname(os.path.abspath(lo))
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        errors: list[str] = []
+        for conv in ("docx", "docx:MS Word 2007 XML"):
+            cmd = [
+                lo,
+                "--headless",
+                "--invisible",
+                "--norestore",
+                "--nodefault",
+                "--nolockcheck",
+                "--nofirststartwizard",
+                "--nologo",
+                f"-env:UserInstallation={profile_uri}",
+                "--convert-to", conv,
+                "--outdir", out_dir,
+                odt_path,
+            ]
+            try:
+                r = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    env=run_env,
+                    cwd=lo_cwd,
+                    startupinfo=startupinfo,
+                    creationflags=creationflags,
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(f"ODT->DOCX ({conv}): timeout (180s)")
+                continue
+
+            if r.returncode == 0 and os.path.isfile(lo_out) and os.path.getsize(lo_out) > 0:
+                if os.path.abspath(lo_out) != os.path.abspath(output_path):
+                    shutil.move(lo_out, output_path)
+                return
+
+            msg = (r.stderr or "").strip() or (r.stdout or "").strip() or "erro sem detalhes"
+            errors.append(f"ODT->DOCX ({conv}): {msg}")
+
+        raise RuntimeError(" | ".join(errors) if errors else "ODT->DOCX não gerou arquivo válido.")
+
+    finally:
+        shutil.rmtree(lo_profile, ignore_errors=True)
+
+
+def _odt_to_docx_via_word_com(odt_path: str, output_path: str) -> None:
+    """
+    Converte ODT -> DOCX usando automação do Microsoft Word (Windows).
+    Usado como alternativa quando o filtro do LibreOffice falha.
+    """
+    import subprocess
+    if os.name != "nt":
+        raise RuntimeError("Conversão via Word COM disponível apenas no Windows.")
+
+    odt_abs = str(Path(odt_path).resolve())
+    docx_abs = str(Path(output_path).resolve())
+    odt_ps = odt_abs.replace("'", "''")
+    docx_ps = docx_abs.replace("'", "''")
+    # wdFormatDocumentDefault = 16 (DOCX)
+    ps_script = (
+        "$ErrorActionPreference='Stop';"
+        "$word=$null;$doc=$null;"
+        f"$in='{odt_ps}';"
+        f"$out='{docx_ps}';"
+        "try {"
+        "  $word = New-Object -ComObject Word.Application;"
+        "  $word.Visible = $false;"
+        "  $word.DisplayAlerts = 0;"
+        "  $doc = $word.Documents.Open($in, $false, $true);"
+        "  $doc.SaveAs([ref]$out, [ref]16);"
+        "}"
+        "finally {"
+        "  if ($doc -ne $null) { $doc.Close([ref]$false) | Out-Null }"
+        "  if ($word -ne $null) { $word.Quit() | Out-Null }"
+        "}"
+    )
     r = subprocess.run(
-        [lo, "--headless", "--norestore", "--convert-to", "docx",
-         "--outdir", out_dir, pdf_path],
-        capture_output=True, text=True, timeout=120,
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        timeout=180,
     )
     if r.returncode != 0:
-        raise RuntimeError(r.stderr or r.stdout or "Erro no LibreOffice")
-    lo_out = os.path.join(out_dir, Path(pdf_path).stem + ".docx")
-    if os.path.abspath(lo_out) != os.path.abspath(output_path):
-        shutil.move(lo_out, output_path)
+        msg = (r.stderr or "").strip() or (r.stdout or "").strip() or "erro sem detalhes"
+        raise RuntimeError(f"ODT->DOCX (Word COM) falhou: {msg}")
+    if not os.path.isfile(docx_abs) or os.path.getsize(docx_abs) == 0:
+        raise RuntimeError("ODT->DOCX (Word COM) não gerou arquivo válido.")
 
 
 PT2EMU = 12700  # 1 ponto PDF = 12700 EMU (English Metric Units)
@@ -196,29 +577,36 @@ def _docx_via_reconstruction(pdf_path: str, output_path: str) -> None:
     import pdfplumber
     from pypdf import PdfReader
     from docx import Document
-    from docx.shared import Pt, RGBColor, Inches
+    from docx.shared import Pt, RGBColor, Inches, Emu
+    from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+    from docx.enum.section import WD_SECTION
+    from docx.enum.text import WD_BREAK
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ROW_HEIGHT_RULE
 
     doc = Document()
     reader = PdfReader(pdf_path)
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for pg_idx, page in enumerate(pdf.pages):
-                if pg_idx > 0:
-                    doc.add_page_break()
+                page_w_pt = float(page.width) if float(page.width) > 0 else 612.0
+                page_h_pt = float(page.height) if float(page.height) > 0 else 792.0
 
-                # ── Tabelas ────────────────────────────────────────────
-                table_bboxes, tables = [], []
-                for tbl in sorted(page.find_tables(), key=lambda t: t.bbox[1]):
-                    data = tbl.extract()
-                    if data:
-                        table_bboxes.append(tbl.bbox)
-                        tables.append({"y": tbl.bbox[1], "data": data})
+                # Usa uma seção por página para preservar melhor dimensões/orientação.
+                if pg_idx == 0:
+                    sec = doc.sections[0]
+                else:
+                    sec = doc.add_section(WD_SECTION.NEW_PAGE)
+                sec.page_width = Emu(int(page_w_pt * PT2EMU))
+                sec.page_height = Emu(int(page_h_pt * PT2EMU))
+
+                # ── Tabelas (detecção robusta) ────────────────────────
+                tables = _find_tables_robust(page)
+                table_bboxes = [(t["x0"], t["y"], t["x1"], t["bottom"]) for t in tables]
 
                 # ── Linhas de texto com posição ────────────────────────
                 text_lines = _page_text_lines(page, table_bboxes)
 
                 # ── Imagens ────────────────────────────────────────────
-                page_w_pt = float(page.width) if float(page.width) > 0 else 612.0
                 images = _page_images(reader.pages[pg_idx], page, page_w_pt)
 
                 # Mescla eventos por posição vertical para manter a leitura do conteúdo
@@ -227,12 +615,42 @@ def _docx_via_reconstruction(pdf_path: str, output_path: str) -> None:
                     [("image", i["y"], i) for i in images] +
                     [("table", t["y"], t) for t in tables]
                 )
-                events.sort(key=lambda e: e[1])
+                prio = {"text": 0, "table": 1, "image": 2}
+                events.sort(key=lambda e: (e[1], prio.get(e[0], 9)))
+                prev_y = None
+                last_text_para = None
+                last_text_x0 = None
+                last_text_y = None
+                last_text_h = None
 
                 for kind, _, payload in events:
+                    curr_y = float(payload.get("y", 0))
+                    if prev_y is not None:
+                        gap = curr_y - prev_y
+                        if gap > 26:
+                            # Mantém separação vertical aproximada entre blocos.
+                            for _ in range(min(3, int(gap // 28))):
+                                doc.add_paragraph("")
+
                     if kind == "text":
-                        p = doc.add_paragraph()
-                        run = p.add_run(payload["text"])
+                        px0 = float(payload.get("x0", 0.0))
+                        ph = float(payload.get("line_height", max(10.0, float(payload.get("size", 11.0)) * 1.2)))
+                        same_para = (
+                            last_text_para is not None and
+                            last_text_y is not None and
+                            last_text_x0 is not None and
+                            abs(px0 - last_text_x0) <= 10 and
+                            (curr_y - last_text_y) <= max(12.0, (last_text_h or ph) * 1.25)
+                        )
+
+                        if same_para:
+                            last_text_para.add_run().add_break(WD_BREAK.LINE)
+                            p = last_text_para
+                            run = p.add_run(payload["text"])
+                        else:
+                            p = doc.add_paragraph()
+                            run = p.add_run(payload["text"])
+
                         run.bold = payload["bold"]
                         run.italic = payload["italic"]
                         run.font.size = Pt(float(payload["size"]))
@@ -244,36 +662,96 @@ def _docx_via_reconstruction(pdf_path: str, output_path: str) -> None:
                                 pass
                         p.paragraph_format.space_before = Pt(0)
                         p.paragraph_format.space_after = Pt(0)
+                        p.paragraph_format.left_indent = Pt(max(0.0, px0 - 8.0))
+
+                        x0 = float(payload.get("x0", 0.0))
+                        x1 = float(payload.get("x1", page_w_pt))
+                        line_w = max(0.0, x1 - x0)
+                        center = (x0 + x1) / 2.0
+                        if abs(center - (page_w_pt / 2.0)) < (page_w_pt * 0.08) and line_w < (page_w_pt * 0.85):
+                            p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                        elif x1 > (page_w_pt * 0.92) and x0 > (page_w_pt * 0.45):
+                            p.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
+                        else:
+                            p.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+                        last_text_para = p
+                        last_text_x0 = px0
+                        last_text_y = curr_y
+                        last_text_h = ph
+                        prev_y = curr_y
                         continue
 
                     if kind == "image":
+                        last_text_para = None
                         data = payload["data"]
                         data.seek(0)
-                        # Largura aproximada da imagem com base na proporção da página do PDF.
-                        max_doc_width_in = 6.5
-                        width_in = max(
-                            0.8, min(max_doc_width_in, (payload["w"] / page_w_pt) * max_doc_width_in)
-                        )
+                        x0 = float(payload.get("x0", 0.0))
+                        x1 = float(payload.get("x1", x0))
+                        has_pos = bool(payload.get("has_pos", False))
+                        if has_pos and x1 > x0:
+                            width_pt = max(12.0, x1 - x0)
+                        else:
+                            # fallback aproximado quando não há bbox confiável
+                            width_pt = max(18.0, min(page_w_pt * 0.9, float(payload.get("w", 120)) * 0.75))
+                        width_in = max(0.14, min(7.0, width_pt / 72.0))
                         p = doc.add_paragraph()
                         p.add_run().add_picture(data, width=Inches(width_in))
                         p.paragraph_format.space_before = Pt(0)
                         p.paragraph_format.space_after = Pt(6)
+                        if has_pos:
+                            p.paragraph_format.left_indent = Pt(max(0.0, x0 - 8.0))
+                        prev_y = curr_y
                         continue
 
+                    last_text_para = None
                     data = payload["data"]
-                    n_cols = max((len(r) for r in data if r), default=1)
-                    tbl = doc.add_table(rows=0, cols=n_cols)
+                    n_rows = len(data)
+                    n_cols = max((len(r) for r in data), default=1)
+                    tbl = doc.add_table(rows=n_rows if n_rows > 0 else 1, cols=n_cols if n_cols > 0 else 1)
                     tbl.style = "Table Grid"
-                    for r_idx, row_data in enumerate(data):
-                        if not row_data:
-                            continue
-                        drow = tbl.add_row()
-                        for c_idx, val in enumerate(row_data[:n_cols]):
+                    tbl.alignment = WD_TABLE_ALIGNMENT.LEFT
+                    try:
+                        tbl.autofit = True
+                    except Exception:
+                        pass
+
+                    col_widths_pt = payload.get("col_widths_pt") or []
+                    use_fixed_widths = False
+                    if len(col_widths_pt) == n_cols:
+                        min_w = min(float(w) for w in col_widths_pt) if col_widths_pt else 0.0
+                        max_w = max(float(w) for w in col_widths_pt) if col_widths_pt else 0.0
+                        # Evita colunas absurdamente estreitas (quebra letra a letra).
+                        if min_w >= 22.0 and max_w <= page_w_pt:
+                            use_fixed_widths = True
+                    if use_fixed_widths:
+                        try:
+                            tbl.autofit = False
+                        except Exception:
+                            pass
+                        for c_idx, w_pt in enumerate(col_widths_pt):
+                            try:
+                                tbl.columns[c_idx].width = Pt(float(w_pt))
+                            except Exception:
+                                pass
+
+                    row_heights_pt = payload.get("row_heights_pt") or []
+                    for r_idx in range(n_rows):
+                        row_data = data[r_idx] if r_idx < len(data) else []
+                        drow = tbl.rows[r_idx]
+                        if use_fixed_widths and r_idx < len(row_heights_pt):
+                            try:
+                                drow.height = Pt(float(row_heights_pt[r_idx]))
+                                drow.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+                            except Exception:
+                                pass
+                        for c_idx in range(n_cols):
+                            val = str(row_data[c_idx] if c_idx < len(row_data) else "" or "").strip()
                             cell = drow.cells[c_idx]
-                            cell.text = str(val or "").strip()
+                            cell.text = val
                             if r_idx == 0 and cell.paragraphs and cell.paragraphs[0].runs:
                                 cell.paragraphs[0].runs[0].bold = True
                     doc.add_paragraph()
+                    prev_y = float(payload.get("bottom", curr_y))
 
         doc.save(output_path)
     finally:
@@ -350,6 +828,154 @@ def _norm_size(size: float) -> int:
     return max(8, min(int(round(size / 2) * 2), 24))
 
 
+def _compact_table_data(data: list[list[str]]) -> list[list[str]]:
+    """
+    Remove colunas vazias/fantasmas para evitar tabelas com dezenas de colunas
+    estreitas que quebram o texto em uma letra por linha no DOCX.
+    """
+    rows = []
+    for row in data or []:
+        vals = [str(v or "").strip() for v in (row or [])]
+        if any(vals):
+            rows.append(vals)
+    if not rows:
+        return []
+
+    n_cols = max(len(r) for r in rows)
+    matrix = [r + [""] * (n_cols - len(r)) for r in rows]
+
+    non_empty = [sum(1 for r in matrix if r[c]) for c in range(n_cols)]
+    min_non_empty = max(1, int(len(matrix) * 0.15))
+    keep = [c for c in range(n_cols) if non_empty[c] >= min_non_empty]
+    if not keep:
+        return []
+
+    compact = [[r[c] for c in keep] for r in matrix]
+    # recorta bordas totalmente vazias que sobraram
+    while compact and compact[0] and all((not r[0]) for r in compact):
+        compact = [r[1:] for r in compact]
+    while compact and compact[0] and all((not r[-1]) for r in compact):
+        compact = [r[:-1] for r in compact]
+
+    compact = [r for r in compact if any(r)]
+    return compact
+
+
+def _bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, (ax1 - ax0) * (ay1 - ay0))
+    area_b = max(0.0, (bx1 - bx0) * (by1 - by0))
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _find_tables_robust(plumb_page) -> list[dict]:
+    """
+    Tenta detectar tabelas com múltiplas estratégias do pdfplumber.
+    Retorna tabelas deduplicadas e já ordenadas por Y.
+    """
+    settings_list = [
+        # padrão robusto para tabelas com linhas
+        {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "intersection_tolerance": 5,
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "edge_min_length": 15,
+            "min_words_vertical": 2,
+            "min_words_horizontal": 1,
+        },
+        # útil quando bordas não estão contínuas
+        {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "intersection_tolerance": 7,
+            "snap_tolerance": 4,
+            "join_tolerance": 4,
+            "min_words_vertical": 2,
+            "min_words_horizontal": 1,
+        },
+        # híbrido
+        {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "text",
+            "intersection_tolerance": 6,
+            "snap_tolerance": 4,
+            "join_tolerance": 4,
+            "edge_min_length": 12,
+            "min_words_vertical": 2,
+            "min_words_horizontal": 1,
+        },
+    ]
+
+    found: list[dict] = []
+    for settings in settings_list:
+        try:
+            tables = plumb_page.find_tables(table_settings=settings)
+        except Exception:
+            continue
+        for tbl in tables:
+            try:
+                data = tbl.extract()
+            except Exception:
+                data = None
+            if not data:
+                continue
+            # limpa linhas/células vazias e remove colunas fantasmas
+            clean = _compact_table_data(data)
+            if not clean:
+                continue
+            x0, y0, x1, y1 = tuple(float(v) for v in tbl.bbox)
+            if (x1 - x0) < 40 or (y1 - y0) < 20:
+                continue
+
+            # Geometria opcional (só usa quando bater com colunas após compactação).
+            try:
+                col_bboxes = [c.bbox for c in tbl.columns]
+                col_widths_pt = [max(8.0, float(c[2] - c[0])) for c in col_bboxes]
+            except Exception:
+                col_widths_pt = []
+            if len(col_widths_pt) != max((len(r) for r in clean), default=0):
+                col_widths_pt = []
+            try:
+                row_bboxes = [r.bbox for r in tbl.rows]
+                row_heights_pt = [max(8.0, float(r[3] - r[1])) for r in row_bboxes]
+            except Exception:
+                row_heights_pt = []
+            if len(row_heights_pt) != len(clean):
+                row_heights_pt = []
+
+            found.append({
+                "y": y0,
+                "x0": x0,
+                "x1": x1,
+                "bottom": y1,
+                "data": clean,
+                "col_widths_pt": col_widths_pt,
+                "row_heights_pt": row_heights_pt,
+                "bbox": (x0, y0, x1, y1),
+            })
+
+    # Dedup por overlap alto de bbox.
+    deduped: list[dict] = []
+    for t in sorted(found, key=lambda d: (d["y"], d["x0"])):
+        if any(_bbox_iou(t["bbox"], k["bbox"]) >= 0.72 for k in deduped):
+            continue
+        deduped.append(t)
+
+    for t in deduped:
+        t.pop("bbox", None)
+    return deduped
+
+
 
 def _page_text_lines(plumb_page, table_bboxes: list) -> list[dict]:
     """
@@ -378,11 +1004,13 @@ def _page_text_lines(plumb_page, table_bboxes: list) -> list[dict]:
 
     words = [w for w in words if not in_table(w)]
 
-    # Agrupa palavras em linhas (tolerância 3 px no top)
+    # Agrupa palavras em linhas (tolerância dinâmica no top)
     line_map: dict[float, list] = {}
     for word in words:
         top = word["top"]
-        key = next((k for k in line_map if abs(k - top) <= 3), top)
+        sz = float(word.get("size", 11) or 11)
+        tol = max(2.0, min(5.0, sz * 0.32))
+        key = next((k for k in line_map if abs(k - top) <= tol), top)
         line_map.setdefault(key, []).append(word)
 
     result = []
@@ -393,15 +1021,20 @@ def _page_text_lines(plumb_page, table_bboxes: list) -> list[dict]:
             continue
         dom  = max(line_words, key=lambda w: w.get("size", 0))
         font = dom.get("fontname", "").lower()
+        x0 = min(w["x0"] for w in line_words)
+        x1 = max(w["x1"] for w in line_words)
+        tops = [float(w.get("top", top_key)) for w in line_words]
+        bottoms = [float(w.get("bottom", top_key + 12)) for w in line_words]
         result.append({
             "y":      top_key,
-            "x0":     line_words[0]["x0"],
-            "x1":     line_words[-1]["x1"],
+            "x0":     x0,
+            "x1":     x1,
             "text":   text,
             "bold":   "bold" in font,
             "italic": "italic" in font or "oblique" in font,
             "size":   _norm_size(dom.get("size", 11)),
             "color":  _color_to_hex(dom.get("non_stroking_color", 0)),
+            "line_height": max(8.0, max(bottoms) - min(tops)),
         })
     return result
 
@@ -440,7 +1073,8 @@ def _page_images(pypdf_page, plumb_page, page_w: float) -> list[dict]:
             if pil_img.mode not in ("RGB", "L"):
                 pil_img = pil_img.convert("RGB")
             w, h = pil_img.size
-            if w < 20 or h < 20:
+            # Permite logos pequenos.
+            if w < 6 or h < 6:
                 continue
 
             buf = io.BytesIO()
@@ -451,12 +1085,27 @@ def _page_images(pypdf_page, plumb_page, page_w: float) -> list[dict]:
                 x0    = meta.get("x0", 0)
                 x1    = meta.get("x1", x0 + w)
                 y_pos = meta.get("top", 0)
+                y_bottom = meta.get("bottom", y_pos + h)
                 ratio = (x0 + x1) / 2 / page_w if page_w > 0 else 0.0
+                has_pos = True
             else:
                 # sem posição: assume canto superior esquerdo
                 y_pos, ratio = 0.0, 0.0
+                x0, x1 = 0.0, float(w)
+                y_bottom = float(h)
+                has_pos = False
 
-            imgs.append({"data": buf, "w": w, "h": h, "y": y_pos, "ratio": ratio})
+            imgs.append({
+                "data": buf,
+                "w": w,
+                "h": h,
+                "y": y_pos,
+                "ratio": ratio,
+                "x0": x0,
+                "x1": x1,
+                "bottom": y_bottom,
+                "has_pos": has_pos,
+            })
         except Exception:
             continue
 
@@ -934,8 +1583,8 @@ def convert():
     if not allowed_file(file.filename):
         return jsonify({"error": "Apenas arquivos PDF são aceitos."}), 400
 
-    if output_format not in ("docx", "xlsx"):
-        return jsonify({"error": "Formato inválido. Use 'docx' ou 'xlsx'."}), 400
+    if output_format not in ("docx", "odt", "xlsx"):
+        return jsonify({"error": "Formato inválido. Use 'docx', 'odt' ou 'xlsx'."}), 400
 
     original_name = Path(secure_filename(file.filename)).stem
     output_filename = f"{original_name}.{output_format}"
@@ -954,7 +1603,42 @@ def convert():
                 logger.info("OCR forçado pelo usuário.")
                 convert_pdf_to_docx_with_ocr_fallback(input_path, output_path)
             else:
-                convert_pdf_to_docx(input_path, output_path)
+                # Modo estrito (sem OCR): pipeline fixo PDF -> ODT -> DOCX.
+                try:
+                    intermediate_odt = os.path.join(base_tmp, f"conversor-{uuid.uuid4()}.odt")
+                    _odt_via_libreoffice(input_path, intermediate_odt)
+                    try:
+                        _odt_to_docx_via_word_com(intermediate_odt, output_path)
+                    except Exception as word_err:
+                        logger.warning("ODT->DOCX via Word COM falhou (%s). Tentando via LibreOffice.", word_err)
+                        _odt_to_docx_via_libreoffice(intermediate_odt, output_path)
+                    try:
+                        if os.path.exists(intermediate_odt):
+                            os.remove(intermediate_odt)
+                    except Exception:
+                        pass
+                except Exception as docx_err:
+                    logger.warning("Conversão DOCX (PDF->ODT->DOCX) falhou: %s", docx_err)
+                    short_reason = str(docx_err).strip()
+                    if len(short_reason) > 220:
+                        short_reason = short_reason[:220].rstrip() + "..."
+                    return jsonify({
+                        "error": (
+                            "Não foi possível converter este PDF para DOCX pelo fluxo ODT. "
+                            f"Detalhe: {short_reason}"
+                        )
+                    }), 422
+        elif output_format == "odt":
+            try:
+                _odt_via_libreoffice(input_path, output_path)
+            except Exception as odt_err:
+                logger.warning("Conversão ODT falhou no LibreOffice: %s", odt_err)
+                return jsonify({
+                    "error": (
+                        "Não foi possível converter este PDF para ODT neste ambiente. "
+                        "Tente DOCX com OCR ou verifique a instalação do LibreOffice."
+                    )
+                }), 422
         else:
             convert_pdf_to_xlsx(input_path, output_path)
 
@@ -965,7 +1649,11 @@ def convert():
         mime = (
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             if output_format == "docx"
-            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            else (
+                "application/vnd.oasis.opendocument.text"
+                if output_format == "odt"
+                else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         )
 
         with open(output_path, "rb") as f:
