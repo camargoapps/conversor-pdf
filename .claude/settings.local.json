@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(.venv/Scripts/pip install *)",
+      "WebSearch",
+      "Bash(python3 -c ' *)",
+      "Bash(py -3 -c ' *)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('Sintaxe OK'\\)\")"
+    ]
+  }
+}
