@@ -103,11 +103,41 @@ def _prepare_lo_env(lo_bin: str) -> dict:
     return env
 
 
+def _docx_seems_layout_broken(docx_path: str) -> bool:
+    """
+    Heurística para detectar DOCX com layout degradado típico de exportação:
+    muitos parágrafos de 1-2 caracteres (texto "quebrado" em coluna estreita).
+    """
+    try:
+        from docx import Document
+
+        doc = Document(docx_path)
+        texts = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+        if len(texts) < 25:
+            return False
+
+        short = sum(1 for t in texts if len(t) <= 2)
+        alpha_short = sum(1 for t in texts if len(t) == 1 and t.isalpha())
+        avg_len = sum(len(t) for t in texts) / len(texts)
+        short_ratio = short / len(texts)
+        alpha_short_ratio = alpha_short / len(texts)
+
+        # Limiares conservadores para evitar falso positivo.
+        return (
+            (short_ratio >= 0.55 and avg_len <= 5.0)
+            or (alpha_short_ratio >= 0.35 and avg_len <= 4.0)
+        )
+    except Exception:
+        # Se não der para inspecionar, não bloqueia o fluxo.
+        return False
+
+
 def _docx_via_libreoffice(pdf_path: str, output_path: str) -> None:
     """Converte via LibreOffice headless — MPL-2.0, uso comercial livre."""
     import subprocess, shutil, tempfile
     lo = _libreoffice_bin()
-    out_dir = os.path.dirname(output_path)
+    # Usa sempre o temp do sistema como outdir para evitar erros de escrita
+    out_dir = tempfile.gettempdir()
     stem = Path(pdf_path).stem
     lo_out = os.path.join(out_dir, f"{stem}.docx")
 
@@ -160,13 +190,27 @@ def _docx_via_libreoffice(pdf_path: str, output_path: str) -> None:
     def _ensure_docx(at_path: str) -> bool:
         return os.path.isfile(at_path) and os.path.getsize(at_path) > 0
 
-    # Sempre usa perfil isolado: evita anexar a sessão aberta do LibreOffice (popup de impressora).
-    lo_profile = tempfile.mkdtemp(prefix="lo-profile-", dir=_pick_runtime_tmpdir())
+    lo_profile = tempfile.mkdtemp(prefix="lo-profile-", dir=tempfile.gettempdir())
     profile_uri = Path(lo_profile).as_uri()
     errors: list[str] = []
     try:
-        # 1) Pipeline mais fiel: PDF -> ODT -> DOCX.
-        tdir = tempfile.mkdtemp(prefix="lo-odt-", dir=_pick_runtime_tmpdir())
+        # 1) PDF → DOCX direto com draw_pdf_import (uma única chamada ao LibreOffice).
+        ok, err = _run_convert(
+            input_path=pdf_path,
+            convert_to="docx:MS Word 2007 XML",
+            outdir=out_dir,
+            timeout_s=90,
+            infilter="draw_pdf_import",
+            profile_uri=profile_uri,
+        )
+        if ok and _ensure_docx(lo_out):
+            if os.path.abspath(lo_out) != os.path.abspath(output_path):
+                shutil.move(lo_out, output_path)
+            return
+        errors.append(f"PDF->DOCX (draw): {err}")
+
+        # 2) Fallback: PDF → ODT → DOCX (duas chamadas, mais compatível).
+        tdir = tempfile.mkdtemp(prefix="lo-odt-", dir=tempfile.gettempdir())
         try:
             odt_path = os.path.join(tdir, f"{stem}.odt")
             ok, err = _run_convert(
@@ -182,7 +226,7 @@ def _docx_via_libreoffice(pdf_path: str, output_path: str) -> None:
                     input_path=odt_path,
                     convert_to="docx:MS Word 2007 XML",
                     outdir=out_dir,
-                    timeout_s=90,
+                    timeout_s=60,
                     profile_uri=profile_uri,
                 )
                 if ok2 and _ensure_docx(lo_out):
@@ -192,65 +236,6 @@ def _docx_via_libreoffice(pdf_path: str, output_path: str) -> None:
                 errors.append(f"ODT->DOCX: {err2}")
             else:
                 errors.append(f"PDF->ODT: {err}")
-        finally:
-            shutil.rmtree(tdir, ignore_errors=True)
-
-        # 2) Draw direto -> DOCX (fallback).
-        ok, err = _run_convert(
-            input_path=pdf_path,
-            convert_to="docx:MS Word 2007 XML",
-            outdir=out_dir,
-            timeout_s=90,
-            infilter="draw_pdf_import",
-            profile_uri=profile_uri,
-        )
-        if ok and _ensure_docx(lo_out):
-            if os.path.abspath(lo_out) != os.path.abspath(output_path):
-                shutil.move(lo_out, output_path)
-            return
-        errors.append(f"PDF->DOCX (Draw): {err}")
-
-        # 3) Fallback: Writer import padrão -> DOCX.
-        ok, err = _run_convert(
-            input_path=pdf_path,
-            convert_to="docx:MS Word 2007 XML",
-            outdir=out_dir,
-            timeout_s=60,
-            profile_uri=profile_uri,
-        )
-        if ok and _ensure_docx(lo_out):
-            if os.path.abspath(lo_out) != os.path.abspath(output_path):
-                shutil.move(lo_out, output_path)
-            return
-        errors.append(f"PDF->DOCX (padrão): {err}")
-
-        # 4) Tentativa em 2 etapas (Draw): PDF -> ODG -> DOCX.
-        tdir = tempfile.mkdtemp(prefix="lo-draw-", dir=_pick_runtime_tmpdir())
-        try:
-            odg_path = os.path.join(tdir, f"{stem}.odg")
-            ok, err = _run_convert(
-                input_path=pdf_path,
-                convert_to="odg",
-                outdir=tdir,
-                timeout_s=60,
-                infilter="draw_pdf_import",
-                profile_uri=profile_uri,
-            )
-            if ok and os.path.isfile(odg_path):
-                ok2, err2 = _run_convert(
-                    input_path=odg_path,
-                    convert_to="docx:MS Word 2007 XML",
-                    outdir=out_dir,
-                    timeout_s=60,
-                    profile_uri=profile_uri,
-                )
-                if ok2 and _ensure_docx(lo_out):
-                    if os.path.abspath(lo_out) != os.path.abspath(output_path):
-                        shutil.move(lo_out, output_path)
-                    return
-                errors.append(f"ODG->DOCX: {err2}")
-            else:
-                errors.append(f"PDF->ODG: {err}")
         finally:
             shutil.rmtree(tdir, ignore_errors=True)
     finally:
@@ -320,21 +305,21 @@ def _odt_via_libreoffice(pdf_path: str, output_path: str) -> None:
         ok, err = _run_convert(
             input_path=pdf_path,
             convert_to="odt:writer8",
-            timeout_s=180,
+            timeout_s=60,
+            infilter="draw_pdf_import",
             profile_uri=profile_uri,
         )
         if ok and os.path.isfile(lo_out) and os.path.getsize(lo_out) > 0:
             if os.path.abspath(lo_out) != os.path.abspath(output_path):
                 shutil.move(lo_out, output_path)
             return
-        errors.append(f"PDF->ODT: {err}")
+        errors.append(f"PDF->ODT (draw): {err}")
 
-        # Fallback com importador Draw explícito.
+        # Fallback sem filtro explícito.
         ok, err = _run_convert(
             input_path=pdf_path,
             convert_to="odt:writer8",
-            timeout_s=180,
-            infilter="draw_pdf_import",
+            timeout_s=60,
             profile_uri=profile_uri,
         )
         if ok and os.path.isfile(lo_out) and os.path.getsize(lo_out) > 0:
@@ -371,7 +356,7 @@ def _odt_to_docx_via_libreoffice(odt_path: str, output_path: str) -> None:
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
         errors: list[str] = []
-        for conv in ("docx", "docx:MS Word 2007 XML"):
+        for conv in ("docx:MS Word 2007 XML", "docx"):
             cmd = [
                 lo,
                 "--headless",
@@ -391,7 +376,7 @@ def _odt_to_docx_via_libreoffice(odt_path: str, output_path: str) -> None:
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=180,
+                    timeout=60,
                     env=run_env,
                     cwd=lo_cwd,
                     startupinfo=startupinfo,
@@ -438,8 +423,8 @@ def _odt_to_docx_via_word_com(odt_path: str, output_path: str) -> None:
         "  $word = New-Object -ComObject Word.Application;"
         "  $word.Visible = $false;"
         "  $word.DisplayAlerts = 0;"
-        "  $doc = $word.Documents.Open($in, $false, $true);"
-        "  $doc.SaveAs([ref]$out, [ref]16);"
+        "  $doc = $word.Documents.Open($in, $false, $true, $false, '', '', $false, '', '', 0, 0, $false);"
+        "  $doc.SaveAs2([ref]$out, [ref]16);"
         "}"
         "finally {"
         "  if ($doc -ne $null) { $doc.Close([ref]$false) | Out-Null }"
@@ -457,6 +442,50 @@ def _odt_to_docx_via_word_com(odt_path: str, output_path: str) -> None:
         raise RuntimeError(f"ODT->DOCX (Word COM) falhou: {msg}")
     if not os.path.isfile(docx_abs) or os.path.getsize(docx_abs) == 0:
         raise RuntimeError("ODT->DOCX (Word COM) não gerou arquivo válido.")
+
+
+def _pdf_to_docx_via_word_com(pdf_path: str, output_path: str) -> None:
+    """
+    Converte PDF -> DOCX diretamente pelo Microsoft Word (Windows).
+    Evita etapa intermediária ODT quando Word COM está disponível.
+    """
+    import subprocess
+    if os.name != "nt":
+        raise RuntimeError("Conversão via Word COM disponível apenas no Windows.")
+
+    pdf_abs = str(Path(pdf_path).resolve())
+    docx_abs = str(Path(output_path).resolve())
+    pdf_ps = pdf_abs.replace("'", "''")
+    docx_ps = docx_abs.replace("'", "''")
+    # Conversão síncrona (sem Task/Runspace) para evitar erro de runspace no Flask thread.
+    ps_script = (
+        "$ErrorActionPreference='Stop';"
+        "$word=$null;$doc=$null;"
+        f"$in='{pdf_ps}';"
+        f"$out='{docx_ps}';"
+        "try {"
+        "  $word = New-Object -ComObject Word.Application;"
+        "  $word.Visible = $false;"
+        "  $word.DisplayAlerts = 0;"
+        "  $doc = $word.Documents.Open($in, $false, $true);"
+        "  $doc.SaveAs2([ref]$out, [ref]16);"
+        "}"
+        "finally {"
+        "  if ($doc -ne $null) { $doc.Close([ref]$false) | Out-Null }"
+        "  if ($word -ne $null) { $word.Quit() | Out-Null }"
+        "}"
+    )
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    if r.returncode != 0:
+        msg = (r.stderr or "").strip() or (r.stdout or "").strip() or "erro sem detalhes"
+        raise RuntimeError(f"PDF->DOCX (Word COM) falhou: {msg}")
+    if not os.path.isfile(docx_abs) or os.path.getsize(docx_abs) == 0:
+        raise RuntimeError("PDF->DOCX (Word COM) não gerou arquivo válido.")
 
 
 PT2EMU = 12700  # 1 ponto PDF = 12700 EMU (English Metric Units)
@@ -777,6 +806,85 @@ def convert_pdf_to_docx(pdf_path: str, output_path: str) -> None:
 
     _docx_via_reconstruction(pdf_path, output_path)
     logger.info("DOCX gerado via reconstrução pdfplumber/pypdf")
+
+
+def _docx_via_fast_text(pdf_path: str, output_path: str) -> None:
+    """
+    Conversão rápida e leve: extrai texto com pypdf e gera DOCX com python-docx.
+    Licenças permissivas (BSD-3 + MIT), adequadas para uso comercial.
+    """
+    from pypdf import PdfReader
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_BREAK
+
+    reader = PdfReader(pdf_path)
+    doc = Document()
+
+    # Estilo padrão enxuto para reduzir tamanho final.
+    try:
+        normal = doc.styles["Normal"]
+        normal.font.name = "Calibri"
+        normal.font.size = Pt(10)
+    except Exception:
+        pass
+
+    for i, page in enumerate(reader.pages):
+        if i > 0:
+            pb = doc.add_paragraph()
+            pb.add_run().add_break(WD_BREAK.PAGE)
+
+        text = page.extract_text() or ""
+        # Agrupa linhas em blocos para reduzir muito o número de parágrafos
+        # (menos peso e gravação mais rápida).
+        lines = [ln.strip() for ln in text.splitlines()]
+        blocks: list[str] = []
+        buf: list[str] = []
+
+        for ln in lines:
+            if ln:
+                buf.append(ln)
+                continue
+            if buf:
+                blocks.append(" ".join(buf))
+                buf = []
+        if buf:
+            blocks.append(" ".join(buf))
+
+        if not blocks:
+            doc.add_paragraph("")
+            continue
+
+        for block in blocks:
+            p = doc.add_paragraph(block)
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.line_spacing = 1.0
+
+    doc.save(output_path)
+
+
+def _docx_via_pdf2docx(pdf_path: str, output_path: str) -> None:
+    """
+    Conversão PDF -> DOCX usando pdf2docx (MIT, uso comercial permitido).
+    Preserva layout melhor que extração de texto pura.
+    """
+    try:
+        from pdf2docx import Converter
+    except Exception as e:
+        raise RuntimeError(
+            "pdf2docx não está disponível no ambiente. "
+            "Instale dependências e reinicie o serviço."
+        ) from e
+
+    cv = Converter(pdf_path)
+    try:
+        cv.convert(output_path, start=0, end=None)
+    finally:
+        cv.close()
+
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError("PDF->DOCX (pdf2docx) não gerou arquivo válido.")
 
 
 def _configure_tesseract(pytesseract_module) -> None:
@@ -1591,6 +1699,7 @@ def convert():
 
     input_path = None
     output_path = None
+    intermediate_odt = None
     try:
         base_tmp = _pick_runtime_tmpdir()
         input_path = os.path.join(base_tmp, f"conversor-{uuid.uuid4()}.pdf")
@@ -1603,34 +1712,31 @@ def convert():
                 logger.info("OCR forçado pelo usuário.")
                 convert_pdf_to_docx_with_ocr_fallback(input_path, output_path)
             else:
-                # Modo estrito (sem OCR): pipeline fixo PDF -> ODT -> DOCX.
                 try:
-                    intermediate_odt = os.path.join(base_tmp, f"conversor-{uuid.uuid4()}.odt")
-                    _odt_via_libreoffice(input_path, intermediate_odt)
-                    try:
-                        _odt_to_docx_via_word_com(intermediate_odt, output_path)
-                    except Exception as word_err:
-                        logger.warning("ODT->DOCX via Word COM falhou (%s). Tentando via LibreOffice.", word_err)
-                        _odt_to_docx_via_libreoffice(intermediate_odt, output_path)
-                    try:
-                        if os.path.exists(intermediate_odt):
-                            os.remove(intermediate_odt)
-                    except Exception:
-                        pass
+                    _docx_via_pdf2docx(input_path, output_path)
+                    logger.info("DOCX gerado via pdf2docx.")
                 except Exception as docx_err:
-                    logger.warning("Conversão DOCX (PDF->ODT->DOCX) falhou: %s", docx_err)
-                    short_reason = str(docx_err).strip()
-                    if len(short_reason) > 220:
-                        short_reason = short_reason[:220].rstrip() + "..."
-                    return jsonify({
-                        "error": (
-                            "Não foi possível converter este PDF para DOCX pelo fluxo ODT. "
-                            f"Detalhe: {short_reason}"
-                        )
-                    }), 422
+                    logger.warning("pdf2docx falhou (%s). Tentando engine fast.", docx_err)
+                    try:
+                        _docx_via_fast_text(input_path, output_path)
+                        logger.info("DOCX gerado via engine fast (fallback).")
+                    except Exception as fast_err:
+                        logger.warning("Conversão DOCX falhou: %s", fast_err)
+                        short_reason = str(fast_err).strip()
+                        if len(short_reason) > 220:
+                            short_reason = short_reason[:220].rstrip() + "..."
+                        return jsonify({
+                            "error": (
+                                "Não foi possível converter este PDF para DOCX. "
+                                f"Detalhe: {short_reason}"
+                            )
+                        }), 422
         elif output_format == "odt":
             try:
-                _odt_via_libreoffice(input_path, output_path)
+                intermediate_odt = os.path.join(base_tmp, f"conversor-{uuid.uuid4()}.odt")
+                _odt_via_libreoffice(input_path, intermediate_odt)
+                if os.path.abspath(intermediate_odt) != os.path.abspath(output_path):
+                    os.replace(intermediate_odt, output_path)
             except Exception as odt_err:
                 logger.warning("Conversão ODT falhou no LibreOffice: %s", odt_err)
                 return jsonify({
@@ -1672,6 +1778,11 @@ def convert():
                 os.remove(output_path)
             except Exception:
                 pass
+        if intermediate_odt and os.path.exists(intermediate_odt):
+            try:
+                os.remove(intermediate_odt)
+            except Exception:
+                pass
 
     return send_file(
         io.BytesIO(data),
@@ -1684,6 +1795,11 @@ def convert():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "app": "CamargoApps PDF Converter"})
+
+
+@app.route("/licenses")
+def licenses():
+    return render_template("licenses.html")
 
 
 if __name__ == "__main__":

@@ -13,3 +13,17 @@ tmp/
 uploads/
 _runtime_tmp/
 tmp_test_*/
+
+# IDE/editor local state
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.swo
+
+# Local assistant/workspace metadata
+.claude/

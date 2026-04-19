@@ -311,6 +311,13 @@ body {
   font-size: .82rem;
 }
 .footer strong { color: var(--accent-light); }
+.footer a {
+  color: var(--accent-light);
+  text-decoration: none;
+}
+.footer a:hover {
+  text-decoration: underline;
+}
 
 /* ── RESPONSIVE ───────────────────────────── */
 @media (max-width: 600px) {
