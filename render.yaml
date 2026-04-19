@@ -4,18 +4,25 @@ services:
     runtime: python
     plan: free
     buildCommand: |
-      apt-get update && apt-get install -y \
+      apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
+        tesseract-ocr-eng \
         tesseract-ocr-por \
         poppler-utils \
         libgl1-mesa-glx \
         libreoffice \
-        && pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 2 --timeout 120 --bind 0.0.0.0:$PORT
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/* \
+        && pip install --no-cache-dir -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
       - key: SECRET_KEY
         generateValue: true
+      - key: CONVERSOR_TMP_DIR
+        value: /tmp/conversor
+      - key: PYTHONUNBUFFERED
+        value: "1"
     healthCheckPath: /health
     autoDeploy: true

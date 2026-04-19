@@ -11,7 +11,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
+max_upload_mb = int(os.environ.get("MAX_UPLOAD_MB", "50"))
+app.config["MAX_CONTENT_LENGTH"] = max_upload_mb * 1024 * 1024
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "camargo-apps-secret")
 
 ALLOWED_EXTENSIONS = {"pdf"}
