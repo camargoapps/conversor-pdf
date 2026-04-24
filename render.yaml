@@ -10,11 +10,10 @@ services:
         tesseract-ocr-por \
         poppler-utils \
         libgl1-mesa-glx \
-        libreoffice \
         && apt-get clean \
         && rm -rf /var/lib/apt/lists/* \
         && pip install --no-cache-dir -r requirements.txt
-    startCommand: gunicorn app:app --workers 1 --timeout 180 --bind 0.0.0.0:$PORT
+    startCommand: gunicorn app:app --workers 1 --max-requests 1 --max-requests-jitter 1 --timeout 180 --bind 0.0.0.0:$PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0

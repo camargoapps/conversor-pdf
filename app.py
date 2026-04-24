@@ -1714,13 +1714,25 @@ def convert():
                 convert_pdf_to_docx_with_ocr_fallback(input_path, output_path)
             else:
                 try:
-                    _docx_via_pdf2docx(input_path, output_path)
-                    logger.info("DOCX gerado via pdf2docx.")
-                except Exception as docx_err:
-                    logger.warning("pdf2docx falhou (%s). Tentando engine fast.", docx_err)
+                    from pypdf import PdfReader as _PR
+                    _page_count = len(_PR(input_path).pages)
+                except Exception:
+                    _page_count = 0
+
+                _use_pdf2docx = _page_count <= int(os.environ.get("PDF2DOCX_MAX_PAGES", "25"))
+
+                if _use_pdf2docx:
+                    try:
+                        _docx_via_pdf2docx(input_path, output_path)
+                        logger.info("DOCX gerado via pdf2docx (%d págs).", _page_count)
+                    except Exception as docx_err:
+                        logger.warning("pdf2docx falhou (%s). Tentando engine fast.", docx_err)
+                        _use_pdf2docx = False
+
+                if not _use_pdf2docx:
                     try:
                         _docx_via_fast_text(input_path, output_path)
-                        logger.info("DOCX gerado via engine fast (fallback).")
+                        logger.info("DOCX gerado via engine fast (%d págs).", _page_count)
                     except Exception as fast_err:
                         logger.warning("Conversão DOCX falhou: %s", fast_err)
                         short_reason = str(fast_err).strip()
