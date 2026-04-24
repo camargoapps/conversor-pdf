@@ -106,6 +106,9 @@
       if (successText) {
         successText.textContent = 'Arquivo convertido com sucesso! O download iniciará automaticamente.';
       }
+
+      await ensureServerAwake();
+
       let res = await fetch('/convert', { method: 'POST', body: formData });
 
       if (!res.ok) {
@@ -181,6 +184,35 @@
     progressWrap.style.display = 'none';
     progressBar.style.width = '0%';
     progressVal = 0;
+  }
+
+  // ── SERVER WAKE-UP ────────────────────────────────
+  async function ensureServerAwake() {
+    const MAX_ATTEMPTS = 8;
+    const INTERVAL_MS  = 4000;
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      try {
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 5000);
+        const r = await fetch('/health', { signal: ctrl.signal });
+        clearTimeout(tid);
+        if (r.ok) return;
+      } catch (_) { /* servidor ainda acordando */ }
+      if (i === 0) showWaking();
+      await new Promise(res => setTimeout(res, INTERVAL_MS));
+    }
+    hideWaking();
+    throw new Error('Servidor indisponível no momento. Aguarde alguns segundos e tente novamente.');
+  }
+
+  function showWaking() {
+    errorMsg.textContent = 'O servidor está acordando, aguarde alguns instantes...';
+    alertError.style.display = 'flex';
+    alertSuccess.style.display = 'none';
+  }
+
+  function hideWaking() {
+    if (errorMsg.textContent.includes('acordando')) hideAlerts();
   }
 
   // ── UI HELPERS ────────────────────────────────────
