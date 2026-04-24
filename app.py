@@ -865,6 +865,144 @@ def _docx_via_fast_text(pdf_path: str, output_path: str) -> None:
     doc.save(output_path)
 
 
+def _ocr_page_to_text(page_image) -> str:
+    """
+    Roda Tesseract numa imagem PIL e retorna o texto extraído.
+    Tenta dois passes: imagem original e versão com contraste aumentado.
+    Retorna o resultado com mais texto.
+    """
+    try:
+        import pytesseract
+        from PIL import ImageEnhance, ImageFilter
+        _configure_tesseract(pytesseract)
+
+        cfg = "--oem 1 --psm 6"
+
+        text1 = pytesseract.image_to_string(page_image, lang="por+eng", config=cfg).strip()
+
+        # Segundo passe: aumenta contraste para capturar texto sobre fundo colorido/foto
+        enhancer = ImageEnhance.Contrast(page_image.convert("L"))
+        high_contrast = enhancer.enhance(2.0).filter(ImageFilter.SHARPEN)
+        text2 = pytesseract.image_to_string(high_contrast, lang="por+eng", config=cfg).strip()
+        del high_contrast
+
+        return text1 if len(text1) >= len(text2) else text2
+    except Exception:
+        return ""
+
+
+def _clean_ocr_text(raw: str) -> str:
+    """Remove linhas de ruído do OCR (símbolos isolados, lixo de fundo)."""
+    import re
+    clean = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Mantém a linha apenas se tiver caracteres alfanuméricos suficientes
+        alnum = sum(c.isalnum() for c in line)
+        if alnum >= 3 and alnum / len(line) >= 0.35:
+            clean.append(line)
+    return "\n".join(clean)
+
+
+def _docx_via_pdfplumber(pdf_path: str, output_path: str) -> None:
+    """
+    Converte PDF → DOCX com texto editável e imagens embutidas.
+    - Páginas com texto digital: pdfplumber (MIT) extrai diretamente.
+    - Páginas sem texto mas com imagem: OCR automático com Tesseract para
+      tornar o texto editável (ex: capas, seções com texto sobre imagem).
+    - Imagens de conteúdo: pypdf (BSD-3) extrai e embute no DOCX.
+    Processa uma página por vez — baixo uso de memória.
+    """
+    import io
+    import pdfplumber
+    import pypdfium2 as pdfium
+    from pypdf import PdfReader
+    from docx import Document
+    from docx.shared import Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from PIL import Image as PilImage
+
+    TEXT_THRESHOLD = 40   # chars mínimos para considerar que há texto digital
+
+    doc = Document()
+    section = doc.sections[0]
+    section.left_margin   = Inches(1.0)
+    section.right_margin  = Inches(1.0)
+    section.top_margin    = Inches(1.0)
+    section.bottom_margin = Inches(1.0)
+    img_max_width = Inches(5.5)
+
+    reader    = PdfReader(pdf_path)
+    n_pages   = len(reader.pages)
+    pdf_render = pdfium.PdfDocument(pdf_path)
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for i in range(n_pages):
+                if i > 0:
+                    doc.add_page_break()
+
+                # ── Texto digital ───────────────────────────────────
+                text = (pdf.pages[i].extract_text(x_tolerance=3, y_tolerance=3) or "").strip()
+
+                # ── OCR seletivo: só em páginas sem texto E com imagem ──
+                # Evita rodar OCR em páginas em branco ou separadores.
+                page_has_images = bool(reader.pages[i].images)
+                used_ocr = False
+                if len(text) < TEXT_THRESHOLD and page_has_images:
+                    pg = pdf_render[i]
+                    bmp = pg.render(scale=200 / 72.0, rotation=0)
+                    pil_pg = bmp.to_pil()
+                    del bmp
+                    pg.close()
+                    ocr_raw = _ocr_page_to_text(pil_pg)
+                    del pil_pg
+                    ocr_clean = _clean_ocr_text(ocr_raw)
+                    if len(ocr_clean) > len(text):
+                        text = ocr_clean
+                        used_ocr = True
+
+                for line in text.splitlines():
+                    stripped = line.rstrip()
+                    if stripped:
+                        p = doc.add_paragraph(stripped)
+                        p.paragraph_format.space_before = Pt(0)
+                        p.paragraph_format.space_after  = Pt(2)
+
+                # ── Imagens de conteúdo ─────────────────────────────
+                # Se OCR foi usado, as imagens são o fundo da página — não embute.
+                if not used_ocr:
+                    try:
+                        for img_obj in reader.pages[i].images:
+                            try:
+                                raw = img_obj.data
+                                pil = PilImage.open(io.BytesIO(raw)).convert("RGB")
+                                if pil.width < 80 or pil.height < 80:
+                                    del pil
+                                    continue
+                                buf = io.BytesIO()
+                                pil.save(buf, format="JPEG", quality=85, optimize=True)
+                                del pil
+                                buf.seek(0)
+                                p = doc.add_paragraph()
+                                p.paragraph_format.space_before = Pt(6)
+                                p.paragraph_format.space_after  = Pt(6)
+                                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                p.add_run().add_picture(buf, width=img_max_width)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+    finally:
+        pdf_render.close()
+
+    doc.save(output_path)
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError("PDF→DOCX (pdfplumber) não gerou arquivo válido.")
+
+
 def _docx_via_pdf2docx(pdf_path: str, output_path: str) -> None:
     """
     Conversão PDF -> DOCX usando pdf2docx (MIT, uso comercial permitido).
@@ -1714,35 +1852,17 @@ def convert():
                 convert_pdf_to_docx_with_ocr_fallback(input_path, output_path)
             else:
                 try:
-                    from pypdf import PdfReader as _PR
-                    _page_count = len(_PR(input_path).pages)
-                except Exception:
-                    _page_count = 0
-
-                _use_pdf2docx = _page_count <= int(os.environ.get("PDF2DOCX_MAX_PAGES", "25"))
-
-                if _use_pdf2docx:
-                    try:
-                        _docx_via_pdf2docx(input_path, output_path)
-                        logger.info("DOCX gerado via pdf2docx (%d págs).", _page_count)
-                    except Exception as docx_err:
-                        logger.warning("pdf2docx falhou (%s). Tentando engine fast.", docx_err)
-                        _use_pdf2docx = False
-
-                if not _use_pdf2docx:
+                    _docx_via_pdf2docx(input_path, output_path)
+                    logger.info("DOCX gerado via pdf2docx.")
+                except Exception as e1:
+                    logger.warning("pdf2docx falhou (%s). Tentando engine fast.", e1)
                     try:
                         _docx_via_fast_text(input_path, output_path)
-                        logger.info("DOCX gerado via engine fast (%d págs).", _page_count)
-                    except Exception as fast_err:
-                        logger.warning("Conversão DOCX falhou: %s", fast_err)
-                        short_reason = str(fast_err).strip()
-                        if len(short_reason) > 220:
-                            short_reason = short_reason[:220].rstrip() + "..."
+                        logger.info("DOCX gerado via engine fast (fallback).")
+                    except Exception as e2:
+                        short_reason = str(e2).strip()[:220]
                         return jsonify({
-                            "error": (
-                                "Não foi possível converter este PDF para DOCX. "
-                                f"Detalhe: {short_reason}"
-                            )
+                            "error": f"Não foi possível converter este PDF para DOCX. Detalhe: {short_reason}"
                         }), 422
         elif output_format == "odt":
             try:
